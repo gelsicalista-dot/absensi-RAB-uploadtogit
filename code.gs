@@ -41,7 +41,7 @@ function include(filename) {
 }
 
 /**
- * Entrypoint POST API Utama untuk seluruh komunikasi Frontend (Stand-alone Netlify Compatible)
+ * Entrypoint POST API Utama untuk seluruh komunikasi Frontend
  */
 function doPost(e) {
   try {
@@ -79,7 +79,13 @@ function doPost(e) {
     } else if (action === 'calculateMonthlyKPI') {
       result = calculateMonthlyKPI(payload[0]);
     } else if (action === 'getGlobalAttendanceList') {
-      result = getGlobalAttendanceList(payload[0], payload[1], payload[2], payload[3]);
+      result = getGlobalAttendanceList(payload[0], payload[1], payload[2], payload[3], payload[4]);
+    } else if (action === 'generateAttendancePDFReport') {
+      result = generateAttendancePDFReport(payload[0], payload[1], payload[2]);
+    } else if (action === 'getHODAttendanceList') {
+      result = getHODAttendanceList(payload[0], payload[1], payload[2], payload[3], payload[4]);
+    } else if (action === 'generateHODAttendancePDFReport') {
+      result = generateHODAttendancePDFReport(payload[0], payload[1], payload[2]);
     } else if (action === 'savePengumuman') {
       result = savePengumuman(payload[0], payload[1], payload[2], payload[3], payload[4]);
     } else if (action === 'deletePengumuman') {
@@ -140,13 +146,11 @@ function doPost(e) {
   }
 }
 
-/**
- * FUNGSI SETUP DATABASE & MIGRASI OTOMATIS
- */
 function setupDatabase() {
   authorizeDrive();
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return;
   
   const schema = {
     [CONFIG.SHEET_KARYAWAN]: [
@@ -233,12 +237,9 @@ function setupDatabase() {
   }
 
   SpreadsheetApp.flush();
-  Logger.log('Inisialisasi & Safe Migrate Database Rumah Air Resort Berhasil!');
+  Logger.log('Inisialisasi & Safe Migrate Database RAB Berhasil!');
 }
 
-/**
- * Mengisi Data Awal (Seeders)
- */
 function seedInitialData(ss) {
   const sheetPengaturan = ss.getSheetByName(CONFIG.SHEET_PENGATURAN);
   sheetPengaturan.getRange('A2:B2').setNumberFormat('@');
@@ -274,7 +275,7 @@ function seedInitialData(ss) {
   for (let i = 1; i < updatedData.length; i++) {
     const role = updatedData[i][4];
     const userTelp = updatedData[i][2];
-    if (role === 'Admin HR' || userTelp.toLowerCase() === 'admin') {
+    if (role === 'Admin HR' || role === 'Admin' || userTelp.toLowerCase() === 'admin') {
       hasAdmin = true;
       break;
     }
@@ -307,7 +308,7 @@ function seedInitialData(ss) {
   if (sheetPengumuman.getLastRow() <= 1) {
     const todayStr = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy');
     sheetPengumuman.appendRow([
-      'PGM-001', todayStr, 'Selamat Datang di Portal Mading Digital RAB', 
+      'PGM-001', todayStr, 'Selamat Datang di Portal Mading Digital Rumah Air', 
       'Seluruh karyawan diwajibkan melakukan scan QR Code Pass & Verifikasi GPS saat jam masuk dan pulang kerja.', 
       'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600',
       'Admin HR', 'Aktif'
@@ -315,9 +316,6 @@ function seedInitialData(ss) {
   }
 }
 
-/**
- * Mengambil daftar Libur Nasional Resmi Indonesia dari Google Calendar API
- */
 function getIndonesianHolidaysMap(startDate, endDate) {
   const holidaysMap = {};
   try {
@@ -332,7 +330,7 @@ function getIndonesianHolidaysMap(startDate, endDate) {
         cal = CalendarApp.getCalendarById(calIds[i]);
         if (cal) break;
       } catch (e) {
-        // Continue to next calendar ID if unauthorized
+        // Continue if unauthorized
       }
     }
 
@@ -365,25 +363,42 @@ function authorizeDrive() {
   }
 }
 
+/**
+ * Safe Data Reader - Menjamin tidak pernah return null/throw exception
+ */
 function getSheetData(sheetName) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(sheetName);
-  if (!sheet) return [];
-  return sheet.getDataRange().getDisplayValues();
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!ss) return [];
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return [];
+    return sheet.getDataRange().getDisplayValues() || [];
+  } catch (err) {
+    Logger.log('Error getSheetData(' + sheetName + '): ' + err.toString());
+    return [];
+  }
 }
 
+/**
+ * Safe Object Array Reader - Mencegah TypeError saat iterasi
+ */
 function getSheetDataAsObjects(sheetName) {
-  const data = getSheetData(sheetName);
-  if (data.length <= 1) return [];
-  const headers = data[0];
-  const rows = data.slice(1);
-  return rows.map(row => {
-    let obj = {};
-    headers.forEach((header, index) => {
-      obj[header] = row[index] || '';
+  try {
+    const data = getSheetData(sheetName);
+    if (!data || data.length <= 1) return [];
+    const headers = data[0];
+    const rows = data.slice(1);
+    return rows.map(row => {
+      let obj = {};
+      headers.forEach((header, index) => {
+        obj[header] = (row && row[index] !== undefined) ? row[index] : '';
+      });
+      return obj;
     });
-    return obj;
-  });
+  } catch (err) {
+    Logger.log('Error getSheetDataAsObjects(' + sheetName + '): ' + err.toString());
+    return [];
+  }
 }
 
 function parseDateStrToDate(dateStr) {
@@ -551,12 +566,20 @@ function uploadFotoToDrive(base64Data, filename) {
 
 function loginUser(noTelp, password) {
   try {
-    const cleanedInputPhone = sanitizePhone(noTelp);
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
+    const inputStr = (noTelp || '').toString().trim();
+    const cleanedInputPhone = sanitizePhone(inputStr);
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
     
     const user = employees.find(e => {
+      if (!e) return false;
       const dbPhone = sanitizePhone(e.no_telp);
-      return dbPhone.toLowerCase() === cleanedInputPhone.toLowerCase() && e.password === password;
+      const matchPhone = dbPhone.toLowerCase() === cleanedInputPhone.toLowerCase();
+      const matchUsername = (e.no_telp && e.no_telp.toString().trim().toLowerCase() === inputStr.toLowerCase()) ||
+                            (e.nama && e.nama.toString().trim().toLowerCase() === inputStr.toLowerCase()) ||
+                            (e.nik && e.nik.toString().trim().toLowerCase() === inputStr.toLowerCase());
+      const matchPass = (e.password === password);
+      
+      return (matchPhone || matchUsername) && matchPass;
     });
 
     if (!user) {
@@ -575,6 +598,12 @@ function loginUser(noTelp, password) {
       };
     }
 
+    // Normalisasi Role Admin agar konsisten di frontend
+    let userRole = user.role || 'Karyawan';
+    if (userRole.toLowerCase().includes('admin')) {
+      userRole = 'Admin HR';
+    }
+
     return {
       success: true,
       user: {
@@ -586,7 +615,7 @@ function loginUser(noTelp, password) {
         status_kawin: user.status_kawin || 'TK/0',
         bank: user.bank || 'Mandiri',
         no_rekening: user.no_rekening || '',
-        role: user.role,
+        role: userRole,
         departemen: user.departemen,
         jabatan: user.jabatan,
         status_karyawan: user.status_karyawan,
@@ -719,30 +748,35 @@ function processAbsensi(nik, userLat, userLong, qrSecretCode, actionType) {
     const isoTodayStr = Utilities.formatDate(todayDate, 'Asia/Jakarta', 'yyyy-MM-dd');
     const timeStr = Utilities.formatDate(todayDate, 'Asia/Jakarta', 'HH:mm:ss');
     
+    const yesterdayDate = new Date(todayDate.getTime() - 24 * 60 * 60 * 1000);
+    const yesterdayStr = Utilities.formatDate(yesterdayDate, 'Asia/Jakarta', 'dd/MM/yyyy');
+
     const rosterList = getSheetDataAsObjects(CONFIG.SHEET_ROSTER);
     const userRosterToday = rosterList.find(r => r.nik === nik && (r.tanggal === isoTodayStr || r.tanggal === todayStr));
 
     let activeShift = null;
     const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT);
 
-    if (userRosterToday) {
-      const shiftVal = userRosterToday.id_shift || userRosterToday.status_hari;
-      if (['OFF', 'CT', 'PH', 'EO', 'S', 'I'].includes(shiftVal)) {
-        const labelMap = {
-          'OFF': 'OFF (Libur)',
-          'CT': 'Cuti Tahunan (CT)',
-          'PH': 'Publik Holiday (PH)',
-          'EO': 'Extra Off (EO)',
-          'S': 'Sakit (S)',
-          'I': 'Izin (I)'
-        };
-        return { success: false, message: 'Hari ini jadwal Anda adalah ' + (labelMap[shiftVal] || shiftVal) + ' pada Roster Shift.' };
+    if (actionType === 'MASUK') {
+      if (userRosterToday) {
+        const shiftVal = userRosterToday.id_shift || userRosterToday.status_hari;
+        if (['OFF', 'CT', 'PH', 'EO', 'S', 'I'].includes(shiftVal)) {
+          const labelMap = {
+            'OFF': 'OFF (Libur)',
+            'CT': 'Cuti Tahunan (CT)',
+            'PH': 'Publik Holiday (PH)',
+            'EO': 'Extra Off (EO)',
+            'S': 'Sakit (S)',
+            'I': 'Izin (I)'
+          };
+          return { success: false, message: 'Hari ini jadwal Anda adalah ' + (labelMap[shiftVal] || shiftVal) + ' pada Roster Shift.' };
+        }
+        activeShift = shifts.find(s => s.id_shift === userRosterToday.id_shift);
       }
-      activeShift = shifts.find(s => s.id_shift === userRosterToday.id_shift);
-    }
 
-    if (!activeShift) {
-      activeShift = shifts[0] || { jam_masuk: '08:00', toleransi_terlambat_menit: '15' };
+      if (!activeShift) {
+        activeShift = shifts[0] || { jam_masuk: '08:00', toleransi_terlambat_menit: '15' };
+      }
     }
 
     const sheetAbsensi = ss.getSheetByName(CONFIG.SHEET_ABSENSI);
@@ -788,20 +822,37 @@ function processAbsensi(nik, userLat, userLong, qrSecretCode, actionType) {
       return { success: true, message: 'Absen Masuk Berhasil! Status: ' + status + ' (' + timeStr + ')' };
 
     } else if (actionType === 'PULANG') {
-      if (existingIndex === -1 || absensiData[existingIndex].jam_masuk === '') {
-        return { success: false, message: 'Anda belum Absen Masuk hari ini!' };
-      }
-      if (absensiData[existingIndex].jam_pulang !== '') {
-        return { success: false, message: 'Anda sudah Absen Pulang hari ini!' };
+      let targetIndex = absensiData.findIndex(a => a.nik === nik && a.tanggal === todayStr && a.jam_masuk !== '' && a.jam_pulang === '');
+      let isOvernightSession = false;
+
+      if (targetIndex === -1) {
+        targetIndex = absensiData.findIndex(a => a.nik === nik && a.tanggal === yesterdayStr && a.jam_masuk !== '' && a.jam_pulang === '');
+        if (targetIndex !== -1) {
+          isOvernightSession = true;
+        }
       }
 
-      const rowNum = existingIndex + 2;
+      if (targetIndex === -1) {
+        const alreadyOutToday = absensiData.some(a => a.nik === nik && a.tanggal === todayStr && a.jam_pulang !== '');
+        if (alreadyOutToday) {
+          return { success: false, message: 'Anda sudah melakukan Absen Pulang hari ini!' };
+        }
+        return { success: false, message: 'Anda belum Absen Masuk untuk sesi shift ini!' };
+      }
+
+      const rowNum = targetIndex + 2;
       sheetAbsensi.getRange(rowNum, 7).setValue(timeStr);
       sheetAbsensi.getRange(rowNum, 8).setNumberFormat('@').setValue(formattedUserLat);
       sheetAbsensi.getRange(rowNum, 9).setNumberFormat('@').setValue(formattedUserLong);
 
       SpreadsheetApp.flush();
-      return { success: true, message: 'Absen Pulang Berhasil! Terima kasih (' + timeStr + ')' };
+
+      const sessionDate = absensiData[targetIndex].tanggal;
+      const successMsg = isOvernightSession
+        ? 'Absen Pulang Berhasil! Sesi Shift Malam (' + sessionDate + ') telah diselesaikan (' + timeStr + '). Terima kasih!'
+        : 'Absen Pulang Berhasil! Terima kasih (' + timeStr + ')';
+
+      return { success: true, message: successMsg };
     }
 
   } catch (err) {
@@ -815,24 +866,35 @@ function getKaryawanDashboard(nik, monthYear) {
     const todayStr = Utilities.formatDate(todayDate, 'Asia/Jakarta', 'dd/MM/yyyy');
     const isoTodayStr = Utilities.formatDate(todayDate, 'Asia/Jakarta', 'yyyy-MM-dd');
     
-    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI);
-    const todayRecord = absensi.find(a => a.nik === nik && a.tanggal === todayStr) || null;
+    const yesterdayDate = new Date(todayDate.getTime() - 24 * 60 * 60 * 1000);
+    const yesterdayStr = Utilities.formatDate(yesterdayDate, 'Asia/Jakarta', 'dd/MM/yyyy');
+
+    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    let todayRecord = absensi.find(a => a.nik === nik && a.tanggal === todayStr) || null;
+    
+    if (!todayRecord) {
+      const pendingYesterday = absensi.find(a => a.nik === nik && a.tanggal === yesterdayStr && a.jam_masuk !== '' && a.jam_pulang === '');
+      if (pendingYesterday) {
+        todayRecord = Object.assign({}, pendingYesterday);
+        todayRecord.isOvernightActive = true;
+      }
+    }
     
     const personalHistory = absensi
       .filter(a => a.nik === nik)
       .reverse()
       .slice(0, 10);
 
-    const announcements = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN)
+    const announcements = (getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN) || [])
       .filter(p => p.status_aktif && p.status_aktif.toString().trim().toLowerCase() === 'aktif')
       .reverse();
 
-    const leaveHistory = getSheetDataAsObjects(CONFIG.SHEET_IZIN)
+    const leaveHistory = (getSheetDataAsObjects(CONFIG.SHEET_IZIN) || [])
       .filter(i => i.nik === nik)
       .reverse();
 
-    const rosterList = getSheetDataAsObjects(CONFIG.SHEET_ROSTER);
-    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT);
+    const rosterList = getSheetDataAsObjects(CONFIG.SHEET_ROSTER) || [];
+    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT) || [];
 
     let currentMonthStr = monthYear;
     if (!currentMonthStr) {
@@ -932,17 +994,17 @@ function getKaryawanDashboard(nik, monthYear) {
 
 function getHODDashboard(nik, departemen) {
   try {
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-    const deptEmployees = employees.filter(e => e.departemen === departemen && e.status_akun === 'Approved' && e.nik !== nik);
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const deptEmployees = employees.filter(e => e && e.departemen === departemen && e.status_akun === 'Approved' && e.nik !== nik);
     
-    const allIzin = getSheetDataAsObjects(CONFIG.SHEET_IZIN);
+    const allIzin = getSheetDataAsObjects(CONFIG.SHEET_IZIN) || [];
     
     const pendingIzinHOD = allIzin.filter(i => {
-      if (i.status_persetujuan !== 'Pending_HOD' && i.status_persetujuan !== 'Pending') return false;
-      const emp = employees.find(e => e.nik === i.nik);
+      if (!i || (i.status_persetujuan !== 'Pending_HOD' && i.status_persetujuan !== 'Pending')) return false;
+      const emp = employees.find(e => e && e.nik === i.nik);
       return emp && emp.departemen === departemen && emp.nik !== nik;
     }).map(i => {
-      const emp = employees.find(e => e.nik === i.nik) || {};
+      const emp = employees.find(e => e && e.nik === i.nik) || {};
       return {
         ...i,
         nama_karyawan: emp.nama || 'N/A'
@@ -950,10 +1012,11 @@ function getHODDashboard(nik, departemen) {
     });
 
     const deptIzinHistory = allIzin.filter(i => {
-      const emp = employees.find(e => e.nik === i.nik);
+      if (!i) return false;
+      const emp = employees.find(e => e && e.nik === i.nik);
       return emp && emp.departemen === departemen;
     }).map(i => {
-      const emp = employees.find(e => e.nik === i.nik) || {};
+      const emp = employees.find(e => e && e.nik === i.nik) || {};
       return {
         ...i,
         nama_karyawan: emp.nama || 'N/A'
@@ -971,23 +1034,34 @@ function getHODDashboard(nik, departemen) {
   }
 }
 
+/**
+ * Safe Admin Dashboard Loader
+ * Menjamin 100% ketersediaan objek data tanpa memicu Layar Putih / Uncaught TypeError
+ */
 function getAdminDashboard() {
   try {
     const todayStr = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy');
-    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI);
-    const karyawan = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-    const izinList = getSheetDataAsObjects(CONFIG.SHEET_IZIN).reverse();
-    const editProfilList = getSheetDataAsObjects(CONFIG.SHEET_EDIT_PROFIL);
-    const announcements = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN).reverse();
+    
+    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    const karyawan = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const izinList = (getSheetDataAsObjects(CONFIG.SHEET_IZIN) || []).reverse();
+    const editProfilList = getSheetDataAsObjects(CONFIG.SHEET_EDIT_PROFIL) || [];
+    const announcements = (getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN) || []).reverse();
 
-    const operationalEmployees = karyawan.filter(k => k.role !== 'Admin HR');
+    // Memfilter karyawan operasional (Abaikan Admin HR/Admin)
+    const operationalEmployees = karyawan.filter(k => {
+      if (!k) return false;
+      const roleStr = (k.role || '').toString().toLowerCase();
+      return !roleStr.includes('admin');
+    });
 
-    const todayAbsensi = absensi.filter(a => a.tanggal === todayStr);
-    const totalHadirToday = todayAbsensi.filter(a => a.status === 'Tepat Waktu' || a.status === 'Terlambat').length;
-    const totalTerlambatToday = todayAbsensi.filter(a => a.status === 'Terlambat').length;
+    const todayAbsensi = absensi.filter(a => a && a.tanggal === todayStr);
+    const totalHadirToday = todayAbsensi.filter(a => a && (a.status === 'Tepat Waktu' || a.status === 'Terlambat')).length;
+    const totalTerlambatToday = todayAbsensi.filter(a => a && a.status === 'Terlambat').length;
     
     const mappedIzinList = izinList.map(i => {
-      const emp = karyawan.find(e => e.nik === i.nik) || {};
+      if (!i) return {};
+      const emp = karyawan.find(e => e && e.nik === i.nik) || {};
       return {
         ...i,
         nama: emp.nama || 'N/A',
@@ -995,35 +1069,46 @@ function getAdminDashboard() {
       };
     });
 
-    const pendingIzinHRD = mappedIzinList.filter(i => i.status_persetujuan === 'Pending_HRD' || i.status_persetujuan === 'Pending');
-    const totalPendingKaryawan = karyawan.filter(k => k.status_akun === 'Pending').length;
-    const totalPendingEditProfil = editProfilList.filter(e => e.status_persetujuan === 'Pending').length;
+    const pendingIzinHRD = mappedIzinList.filter(i => i && (i.status_persetujuan === 'Pending_HRD' || i.status_persetujuan === 'Pending'));
+    const pendingKaryawan = karyawan.filter(k => k && k.status_akun === 'Pending');
+    const pendingEditProfil = editProfilList.filter(e => e && e.status_persetujuan === 'Pending');
 
     return {
       success: true,
       stats: {
-        totalKaryawan: operationalEmployees.filter(k => k.status_akun === 'Approved' && (k.status_kerja !== 'Resign')).length,
+        totalKaryawan: operationalEmployees.filter(k => k && k.status_akun === 'Approved' && (k.status_kerja !== 'Resign')).length,
         totalHadirToday: totalHadirToday,
         totalTerlambatToday: totalTerlambatToday,
         totalPendingIzin: pendingIzinHRD.length,
-        totalPendingKaryawan: totalPendingKaryawan,
-        totalPendingEditProfil: totalPendingEditProfil
+        totalPendingKaryawan: pendingKaryawan.length,
+        totalPendingEditProfil: pendingEditProfil.length
       },
       pendingIzin: pendingIzinHRD,
       allIzin: mappedIzinList,
-      pendingKaryawan: karyawan.filter(k => k.status_akun === 'Pending'),
-      pendingEditProfil: editProfilList.filter(e => e.status_persetujuan === 'Pending'),
+      pendingKaryawan: pendingKaryawan,
+      pendingEditProfil: pendingEditProfil,
       karyawanList: operationalEmployees,
       announcements: announcements
     };
   } catch (err) {
-    return { success: false, message: err.toString() };
+    Logger.log('Error getAdminDashboard: ' + err.toString());
+    return { 
+      success: false, 
+      message: 'Gagal memuat Dashboard Admin: ' + err.toString(),
+      stats: { totalKaryawan: 0, totalHadirToday: 0, totalTerlambatToday: 0, totalPendingIzin: 0, totalPendingKaryawan: 0, totalPendingEditProfil: 0 },
+      pendingIzin: [],
+      allIzin: [],
+      pendingKaryawan: [],
+      pendingEditProfil: [],
+      karyawanList: [],
+      announcements: []
+    };
   }
 }
 
 function verifyPayrollPIN(pinInput) {
   try {
-    const settings = getSheetDataAsObjects(CONFIG.SHEET_PENGATURAN)[0] || {};
+    const settings = (getSheetDataAsObjects(CONFIG.SHEET_PENGATURAN) || [])[0] || {};
     const validPin = settings.pin_payroll || '123456';
 
     if (pinInput === validPin) {
@@ -1038,8 +1123,13 @@ function verifyPayrollPIN(pinInput) {
 
 function getSalaryMasterList() {
   try {
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN).filter(k => k.status_akun === 'Approved' && k.role !== 'Admin HR');
-    const salaryMasters = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER);
+    const employees = (getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || []).filter(k => {
+      if (!k) return false;
+      const roleStr = (k.role || '').toString().toLowerCase();
+      return k.status_akun === 'Approved' && !roleStr.includes('admin');
+    });
+    
+    const salaryMasters = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER) || [];
 
     const result = employees.map(emp => {
       const sal = salaryMasters.find(s => s.nik === emp.nik) || {};
@@ -1072,7 +1162,7 @@ function saveSalaryMaster(nik, salaryData) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_GAJI_MASTER);
-    const masterList = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER);
+    const masterList = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER) || [];
 
     const idx = masterList.findIndex(m => m.nik === nik);
     if (idx !== -1) {
@@ -1109,17 +1199,21 @@ function saveSalaryMaster(nik, salaryData) {
 function calculateMonthlyPayroll(bulanTahun) {
   try {
     const cutOff = getCutoffRange(bulanTahun);
-    let karyawan = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN).filter(k => k.status_akun === 'Approved' && k.role !== 'Admin HR');
+    let karyawan = (getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || []).filter(k => {
+      if (!k) return false;
+      const roleStr = (k.role || '').toString().toLowerCase();
+      return k.status_akun === 'Approved' && !roleStr.includes('admin');
+    });
     
     karyawan = karyawan.filter(emp => {
       if (!emp.tgl_resign || emp.tgl_resign === '') return true;
       return emp.tgl_resign >= cutOff.startIsoStr;
     });
 
-    const salaryMasters = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER);
-    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI);
-    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN);
-    const existingPayroll = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN);
+    const salaryMasters = getSheetDataAsObjects(CONFIG.SHEET_GAJI_MASTER) || [];
+    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN) || [];
+    const existingPayroll = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN) || [];
 
     const payrollList = karyawan.map(emp => {
       const existingRecord = existingPayroll.find(p => p.nik === emp.nik && p.bulan_tahun === bulanTahun);
@@ -1157,7 +1251,7 @@ function calculateMonthlyPayroll(bulanTahun) {
       };
 
       const empAbsensi = absensi.filter(a => {
-        if (a.nik !== emp.nik || !a.tanggal) return false;
+        if (!a || a.nik !== emp.nik || !a.tanggal) return false;
         const parts = a.tanggal.split('/');
         if (parts.length === 3) {
           const recDate = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
@@ -1283,9 +1377,9 @@ function savePayrollRun(bulanTahun, payrollItems) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheetPayroll = ss.getSheetByName(CONFIG.SHEET_PAYROLL_BULANAN);
-    const existingPayroll = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN);
+    const existingPayroll = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN) || [];
     const sheetLoans = ss.getSheetByName(CONFIG.SHEET_PINJAMAN);
-    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN);
+    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN) || [];
 
     const todayStr = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy HH:mm');
 
@@ -1351,13 +1445,13 @@ function savePayrollRun(bulanTahun, payrollItems) {
 
 function getPersonalPayslip(nik, bulanTahun) {
   try {
-    const payrollList = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN);
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-    const emp = employees.find(e => e.nik === nik);
+    const payrollList = getSheetDataAsObjects(CONFIG.SHEET_PAYROLL_BULANAN) || [];
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const emp = employees.find(e => e && e.nik === nik);
 
     if (!emp) return { success: false, message: 'Karyawan tidak ditemukan.' };
 
-    const record = payrollList.find(p => p.nik === nik && p.bulan_tahun === bulanTahun);
+    const record = payrollList.find(p => p && p.nik === nik && p.bulan_tahun === bulanTahun);
     if (!record) {
       return { success: false, message: 'Slip gaji periode ' + bulanTahun + ' belum diterbitkan oleh Admin HRD.' };
     }
@@ -1396,11 +1490,12 @@ function getPersonalPayslip(nik, bulanTahun) {
 
 function getLoansList() {
   try {
-    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN);
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
+    const loans = getSheetDataAsObjects(CONFIG.SHEET_PINJAMAN) || [];
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
 
     const result = loans.map(l => {
-      const emp = employees.find(e => e.nik === l.nik) || {};
+      if (!l) return {};
+      const emp = employees.find(e => e && e.nik === l.nik) || {};
       return {
         ...l,
         nama: emp.nama || 'N/A',
@@ -1491,8 +1586,8 @@ function approveEditProfil(idPengajuan, actionStatus) {
     const sheetEdit = ss.getSheetByName(CONFIG.SHEET_EDIT_PROFIL);
     if (!sheetEdit) return { success: false, message: 'Tabel pengajuan edit profil belum tersedia.' };
 
-    const editData = getSheetDataAsObjects(CONFIG.SHEET_EDIT_PROFIL);
-    const idx = editData.findIndex(e => e.id_pengajuan === idPengajuan);
+    const editData = getSheetDataAsObjects(CONFIG.SHEET_EDIT_PROFIL) || [];
+    const idx = editData.findIndex(e => e && e.id_pengajuan === idPengajuan);
 
     if (idx === -1) return { success: false, message: 'Data pengajuan edit profil tidak ditemukan.' };
 
@@ -1501,8 +1596,8 @@ function approveEditProfil(idPengajuan, actionStatus) {
 
     if (actionStatus === 'Approved') {
       const sheetEmp = ss.getSheetByName(CONFIG.SHEET_KARYAWAN);
-      const empData = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-      const empIdx = empData.findIndex(e => e.nik === item.nik);
+      const empData = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+      const empIdx = empData.findIndex(e => e && e.nik === item.nik);
 
       if (empIdx !== -1) {
         const rowNum = empIdx + 2;
@@ -1531,8 +1626,8 @@ function approveKaryawan(nik, actionStatus) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_KARYAWAN);
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-    const index = employees.findIndex(e => e.nik === nik);
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const index = employees.findIndex(e => e && e.nik === nik);
 
     if (index === -1) return { success: false, message: 'Data karyawan tidak ditemukan.' };
 
@@ -1549,8 +1644,8 @@ function approveKaryawan(nik, actionStatus) {
 function submitIzinCuti(nik, tglMulai, tglSelesai, jumlahHari, jenis, alasan) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-    const emp = employees.find(e => e.nik === nik);
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const emp = employees.find(e => e && e.nik === nik);
 
     if (!emp) return { success: false, message: 'Data karyawan tidak ditemukan.' };
 
@@ -1561,8 +1656,9 @@ function submitIzinCuti(nik, tglMulai, tglSelesai, jumlahHari, jenis, alasan) {
       }
     }
 
+    const empRoleLower = (emp.role || '').toString().toLowerCase();
     let initialStatus = 'Pending_HOD';
-    if (emp.role === 'HOD' || emp.role === 'Admin HR') {
+    if (empRoleLower.includes('hod') || empRoleLower.includes('admin')) {
       initialStatus = 'Pending_HRD';
     }
 
@@ -1584,8 +1680,8 @@ function approveIzinCuti(idIzin, action, rejectionReason) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheetIzin = ss.getSheetByName(CONFIG.SHEET_IZIN);
-    const izinData = getSheetDataAsObjects(CONFIG.SHEET_IZIN);
-    const index = izinData.findIndex(i => i.id_izin === idIzin);
+    const izinData = getSheetDataAsObjects(CONFIG.SHEET_IZIN) || [];
+    const index = izinData.findIndex(i => i && i.id_izin === idIzin);
 
     if (index === -1) return { success: false, message: 'Data pengajuan tidak ditemukan.' };
 
@@ -1615,8 +1711,8 @@ function approveIzinCuti(idIzin, action, rejectionReason) {
     if (newStatus === 'Approved') {
       if (item.jenis === 'Cuti Tahunan' || item.jenis === 'Cuti') {
         const sheetEmp = ss.getSheetByName(CONFIG.SHEET_KARYAWAN);
-        const empData = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
-        const empIdx = empData.findIndex(e => e.nik === item.nik);
+        const empData = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+        const empIdx = empData.findIndex(e => e && e.nik === item.nik);
         
         if (empIdx !== -1) {
           const currentSisa = parseInt(empData[empIdx].sisa_cuti_tahunan || '0', 10);
@@ -1637,13 +1733,13 @@ function approveIzinCuti(idIzin, action, rejectionReason) {
 
       if (startDate && endDate) {
         const sheetRoster = ss.getSheetByName(CONFIG.SHEET_ROSTER);
-        const rosterData = getSheetDataAsObjects(CONFIG.SHEET_ROSTER);
+        const rosterData = getSheetDataAsObjects(CONFIG.SHEET_ROSTER) || [];
 
         let cur = new Date(startDate);
         while (cur <= endDate) {
           const isoDate = Utilities.formatDate(cur, 'Asia/Jakarta', 'yyyy-MM-dd');
           
-          const rosterIdx = rosterData.findIndex(r => r.nik === item.nik && r.tanggal === isoDate);
+          const rosterIdx = rosterData.findIndex(r => r && r.nik === item.nik && r.tanggal === isoDate);
           if (rosterIdx !== -1) {
             sheetRoster.getRange(rosterIdx + 2, 4).setValue(shiftCode);
             sheetRoster.getRange(rosterIdx + 2, 5).setValue(shiftCode);
@@ -1664,17 +1760,17 @@ function approveIzinCuti(idIzin, action, rejectionReason) {
 }
 
 function getShiftList() {
-  return { success: true, data: getSheetDataAsObjects(CONFIG.SHEET_SHIFT) };
+  return { success: true, data: getSheetDataAsObjects(CONFIG.SHEET_SHIFT) || [] };
 }
 
 function saveShift(idShift, namaShift, jamMasuk, jamPulang, toleransi, oldShiftId) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_SHIFT);
-    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT);
+    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT) || [];
 
     const targetSearchId = oldShiftId || idShift;
-    const idx = shifts.findIndex(s => s.id_shift === targetSearchId);
+    const idx = shifts.findIndex(s => s && s.id_shift === targetSearchId);
 
     if (idx !== -1) {
       const row = idx + 2;
@@ -1699,8 +1795,8 @@ function deleteShift(idShift) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_SHIFT);
-    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT);
-    const idx = shifts.findIndex(s => s.id_shift === idShift);
+    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT) || [];
+    const idx = shifts.findIndex(s => s && s.id_shift === idShift);
 
     if (idx !== -1) {
       sheet.deleteRow(idx + 2);
@@ -1714,17 +1810,17 @@ function deleteShift(idShift) {
 }
 
 function getDepartemenList() {
-  return { success: true, data: getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN) };
+  return { success: true, data: getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN) || [] };
 }
 
 function saveDepartemen(idDept, namaDept) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_DEPARTEMEN);
-    const depts = getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN);
+    const depts = getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN) || [];
 
     if (idDept) {
-      const idx = depts.findIndex(d => d.id_departemen === idDept);
+      const idx = depts.findIndex(d => d && d.id_departemen === idDept);
       if (idx !== -1) {
         sheet.getRange(idx + 2, 2).setValue(namaDept);
       }
@@ -1744,8 +1840,8 @@ function deleteDepartemen(idDept) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_DEPARTEMEN);
-    const depts = getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN);
-    const idx = depts.findIndex(d => d.id_departemen === idDept);
+    const depts = getSheetDataAsObjects(CONFIG.SHEET_DEPARTEMEN) || [];
+    const idx = depts.findIndex(d => d && d.id_departemen === idDept);
 
     if (idx !== -1) {
       sheet.deleteRow(idx + 2);
@@ -1762,7 +1858,7 @@ function savePengumuman(idPengumuman, judul, isi, status, fotoBase64) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_PENGUMUMAN);
-    const list = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN);
+    const list = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN) || [];
     const todayStr = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'dd/MM/yyyy');
 
     let photoUrl = 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600';
@@ -1771,7 +1867,7 @@ function savePengumuman(idPengumuman, judul, isi, status, fotoBase64) {
     }
 
     if (idPengumuman) {
-      const idx = list.findIndex(p => p.id_pengumuman === idPengumuman);
+      const idx = list.findIndex(p => p && p.id_pengumuman === idPengumuman);
       if (idx !== -1) {
         const row = idx + 2;
         sheet.getRange(row, 3).setValue(judul);
@@ -1797,8 +1893,8 @@ function deletePengumuman(idPengumuman) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(CONFIG.SHEET_PENGUMUMAN);
-    const list = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN);
-    const idx = list.findIndex(p => p.id_pengumuman === idPengumuman);
+    const list = getSheetDataAsObjects(CONFIG.SHEET_PENGUMUMAN) || [];
+    const idx = list.findIndex(p => p && p.id_pengumuman === idPengumuman);
 
     if (idx !== -1) {
       sheet.deleteRow(idx + 2);
@@ -1814,12 +1910,16 @@ function deletePengumuman(idPengumuman) {
 function calculateMonthlyKPI(bulanTahun) {
   try {
     const cutOff = getCutoffRange(bulanTahun);
-    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI);
-    const karyawan = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN).filter(k => k.status_akun === 'Approved' && k.role !== 'Admin HR');
+    const absensi = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    const karyawan = (getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || []).filter(k => {
+      if (!k) return false;
+      const roleStr = (k.role || '').toString().toLowerCase();
+      return k.status_akun === 'Approved' && !roleStr.includes('admin');
+    });
 
     const kpiResults = karyawan.map(emp => {
       const empAbsensi = absensi.filter(a => {
-        if (a.nik !== emp.nik || !a.tanggal) return false;
+        if (!a || a.nik !== emp.nik || !a.tanggal) return false;
         const parts = a.tanggal.split('/');
         if (parts.length === 3) {
           const recDate = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
@@ -1863,13 +1963,41 @@ function calculateMonthlyKPI(bulanTahun) {
   }
 }
 
-function getGlobalAttendanceList(searchKey, filterDept, page, limit) {
+function matchesDateOrMonth(targetDateStr, filterStr) {
+  if (!filterStr || !targetDateStr) return false;
+  targetDateStr = targetDateStr.toString().trim();
+  filterStr = filterStr.toString().trim();
+  if (targetDateStr === filterStr || targetDateStr.indexOf(filterStr) !== -1) return true;
+
+  // Format YYYY-MM-DD -> DD/MM/YYYY
+  if (/^\d{4}-\d{2}-\d{2}$/.test(filterStr)) {
+    const p = filterStr.split('-');
+    const dmy = p[2] + '/' + p[1] + '/' + p[0];
+    if (targetDateStr.indexOf(dmy) !== -1) return true;
+  }
+  // Format YYYY-MM -> /MM/YYYY
+  if (/^\d{4}-\d{2}$/.test(filterStr)) {
+    const p = filterStr.split('-');
+    const my = '/' + p[1] + '/' + p[0];
+    if (targetDateStr.indexOf(my) !== -1) return true;
+  }
+  // Format DD/MM/YYYY -> YYYY-MM-DD
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(filterStr)) {
+    const p = filterStr.split('/');
+    const ymd = p[2] + '-' + p[1] + '-' + p[0];
+    if (targetDateStr.indexOf(ymd) !== -1) return true;
+  }
+  return false;
+}
+
+function getGlobalAttendanceList(searchKey, filterDept, filterDateMonth, page, limit) {
   try {
-    let data = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI);
-    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN);
+    let data = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
     
     data = data.map(item => {
-      const emp = employees.find(e => e.nik === item.nik) || {};
+      if (!item) return {};
+      const emp = employees.find(e => e && e.nik === item.nik) || {};
       return {
         ...item,
         nama_karyawan: emp.nama || 'N/A',
@@ -1877,12 +2005,11 @@ function getGlobalAttendanceList(searchKey, filterDept, page, limit) {
       };
     }).reverse();
 
-    if (searchKey) {
-      const key = searchKey.toLowerCase();
+    if (searchKey && searchKey.trim() !== '') {
+      const key = searchKey.toLowerCase().trim();
       data = data.filter(d => 
-        d.nama_karyawan.toLowerCase().includes(key) || 
-        d.tanggal.includes(key) || 
-        d.nik.toLowerCase().includes(key)
+        (d.nama_karyawan && d.nama_karyawan.toLowerCase().includes(key)) || 
+        (d.nik && d.nik.toLowerCase().includes(key))
       );
     }
 
@@ -1890,17 +2017,184 @@ function getGlobalAttendanceList(searchKey, filterDept, page, limit) {
       data = data.filter(d => d.departemen === filterDept);
     }
 
+    if (filterDateMonth && filterDateMonth.trim() !== '') {
+      const dm = filterDateMonth.trim();
+      data = data.filter(d => d.tanggal && matchesDateOrMonth(d.tanggal, dm));
+    }
+
     const totalRecords = data.length;
-    const startIndex = (page - 1) * limit;
-    const paginatedData = data.slice(startIndex, startIndex + limit);
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 15;
+    const startIndex = (pageNum - 1) * limitNum;
+    const paginatedData = data.slice(startIndex, startIndex + limitNum);
 
     return {
       success: true,
       data: paginatedData,
       total: totalRecords,
-      totalPages: Math.ceil(totalRecords / limit),
-      currentPage: page
+      totalPages: Math.ceil(totalRecords / limitNum),
+      currentPage: pageNum
     };
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+function generateAttendancePDFReport(searchKey, filterDept, filterDateMonth) {
+  try {
+    let data = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    
+    data = data.map(item => {
+      if (!item) return {};
+      const emp = employees.find(e => e && e.nik === item.nik) || {};
+      return {
+        ...item,
+        nama_karyawan: emp.nama || 'N/A',
+        departemen: emp.departemen || '-'
+      };
+    }).reverse();
+
+    if (searchKey && searchKey.trim() !== '') {
+      const key = searchKey.toLowerCase().trim();
+      data = data.filter(d => 
+        (d.nama_karyawan && d.nama_karyawan.toLowerCase().includes(key)) || 
+        (d.nik && d.nik.toLowerCase().includes(key))
+      );
+    }
+
+    if (filterDept && filterDept !== 'ALL') {
+      data = data.filter(d => d.departemen === filterDept);
+    }
+
+    if (filterDateMonth && filterDateMonth.trim() !== '') {
+      const dm = filterDateMonth.trim();
+      data = data.filter(d => d.tanggal && matchesDateOrMonth(d.tanggal, dm));
+    }
+
+    let filterInfo = [];
+    if (filterDept && filterDept !== 'ALL') filterInfo.push('Departemen: ' + filterDept);
+    else filterInfo.push('Departemen: Semua');
+    if (filterDateMonth && filterDateMonth.trim() !== '') filterInfo.push('Periode/Tgl: ' + filterDateMonth);
+    else filterInfo.push('Periode: Semua Tanggal');
+    if (searchKey && searchKey.trim() !== '') filterInfo.push('Pencarian: "' + searchKey + '"');
+
+    let htmlContent = '<div style="font-family:Arial, sans-serif; padding:15px; color:#1e293b;">';
+    htmlContent += '<h2 style="text-align:center; color:#1e1b4b; margin:0 0 5px 0;">RUMAH AIR BOGOR</h2>';
+    htmlContent += '<h4 style="text-align:center; color:#4338ca; margin:0 0 5px 0;">LAPORAN REKAPITULASI RIWAYAT PRESENSI</h4>';
+    htmlContent += '<p style="text-align:center; font-size:11px; color:#64748b; margin:0 0 15px 0;">' + filterInfo.join(' | ') + ' &bull; Total Baris: ' + data.length + '</p>';
+    
+    htmlContent += '<table border="1" cellpadding="5" cellspacing="0" style="width:100%; border-collapse:collapse; font-size:10px; border-color:#cbd5e1;">';
+    htmlContent += '<tr style="background-color:#1e1b4b; color:white; font-size:9.5px; text-transform:uppercase;">' +
+      '<th style="width:25px; text-align:center;">No</th>' +
+      '<th>Tanggal</th>' +
+      '<th>NIK</th>' +
+      '<th>Nama Karyawan</th>' +
+      '<th>Departemen</th>' +
+      '<th style="text-align:center;">Jam Masuk</th>' +
+      '<th style="text-align:center;">Jam Pulang</th>' +
+      '<th style="text-align:center;">Status</th>' +
+      '<th style="text-align:center;">Terlambat</th>' +
+      '</tr>';
+
+    if (data.length === 0) {
+      htmlContent += '<tr><td colspan="9" style="text-align:center; padding:15px; color:#94a3b8;">Tidak ada data riwayat absensi yang sesuai filter.</td></tr>';
+    } else {
+      data.forEach((row, idx) => {
+        const bgRow = (idx % 2 === 1) ? '#f8fafc' : '#ffffff';
+        const statusColor = (row.status === 'Tepat Waktu') ? '#059669' : '#e11d48';
+        htmlContent += '<tr style="background-color:' + bgRow + ';">' +
+          '<td style="text-align:center;">' + (idx + 1) + '</td>' +
+          '<td>' + (row.tanggal || '-') + '</td>' +
+          '<td style="font-weight:bold; color:#312e81;">' + (row.nik || '-') + '</td>' +
+          '<td>' + (row.nama_karyawan || '-') + '</td>' +
+          '<td>' + (row.departemen || '-') + '</td>' +
+          '<td style="text-align:center; font-family:monospace;">' + (row.jam_masuk || '-') + '</td>' +
+          '<td style="text-align:center; font-family:monospace;">' + (row.jam_pulang || '-') + '</td>' +
+          '<td style="text-align:center; font-weight:bold; color:' + statusColor + ';">' + (row.status || '-') + '</td>' +
+          '<td style="text-align:center;">' + (row.keterlambatan_menit ? row.keterlambatan_menit + ' mnt' : '-') + '</td>' +
+          '</tr>';
+      });
+    }
+
+    htmlContent += '</table>';
+    htmlContent += '<p style="text-align:right; font-size:9px; color:#94a3b8; margin-top:20px;">Dicetak otomatis oleh Sistem HR RUMAH AIR BOGOR pada ' + (new Date().toLocaleString('id-ID')) + '</p>';
+    htmlContent += '</div>';
+
+    const safeFileTitle = 'Laporan_Absensi_RAB_' + (filterDateMonth || 'All').replace(/[^a-zA-Z0-9]/g, '_');
+    const blob = Utilities.newBlob(htmlContent, 'text/html', safeFileTitle + '.html');
+    const pdfBlob = blob.getAs('application/pdf');
+    const base64Pdf = Utilities.base64Encode(pdfBlob.getBytes());
+
+    return {
+      success: true,
+      pdfBase64: 'data:application/pdf;base64,' + base64Pdf,
+      fileName: safeFileTitle + '.pdf'
+    };
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+function getHODAttendanceList(hodNik, searchKey, filterDateMonth, page, limit) {
+  try {
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const hod = employees.find(e => e && e.nik === hodNik);
+    if (!hod) return { success: false, message: 'Data HOD tidak ditemukan.' };
+    const dept = hod.departemen;
+
+    let data = getSheetDataAsObjects(CONFIG.SHEET_ABSENSI) || [];
+    data = data.map(item => {
+      if (!item) return {};
+      const emp = employees.find(e => e && e.nik === item.nik) || {};
+      return {
+        ...item,
+        nama_karyawan: emp.nama || 'N/A',
+        departemen: emp.departemen || '-'
+      };
+    }).reverse();
+
+    // Data isolation: hanya staf di departemen HOD
+    data = data.filter(d => d.departemen === dept);
+
+    if (searchKey && searchKey.trim() !== '') {
+      const key = searchKey.toLowerCase().trim();
+      data = data.filter(d => 
+        (d.nama_karyawan && d.nama_karyawan.toLowerCase().includes(key)) || 
+        (d.nik && d.nik.toLowerCase().includes(key))
+      );
+    }
+
+    if (filterDateMonth && filterDateMonth.trim() !== '') {
+      const dm = filterDateMonth.trim();
+      data = data.filter(d => d.tanggal && matchesDateOrMonth(d.tanggal, dm));
+    }
+
+    const totalRecords = data.length;
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 15;
+    const startIndex = (pageNum - 1) * limitNum;
+    const paginatedData = data.slice(startIndex, startIndex + limitNum);
+
+    return {
+      success: true,
+      data: paginatedData,
+      total: totalRecords,
+      departemen: dept,
+      totalPages: Math.ceil(totalRecords / limitNum),
+      currentPage: pageNum
+    };
+  } catch (err) {
+    return { success: false, message: err.toString() };
+  }
+}
+
+function generateHODAttendancePDFReport(hodNik, searchKey, filterDateMonth) {
+  try {
+    const employees = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || [];
+    const hod = employees.find(e => e && e.nik === hodNik);
+    if (!hod) return { success: false, message: 'Data HOD tidak ditemukan.' };
+    return generateAttendancePDFReport(searchKey, hod.departemen, filterDateMonth);
   } catch (err) {
     return { success: false, message: err.toString() };
   }
@@ -2001,7 +2295,11 @@ function saveOfficeSettings(lat, long, radius, qrCode, pinPayroll, rateDenda) {
 function getRosterData(monthYear, filterDept) {
   try {
     const cutOff = getCutoffRange(monthYear);
-    let karyawan = getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN).filter(k => k.status_akun === 'Approved' && k.role !== 'Admin HR');
+    let karyawan = (getSheetDataAsObjects(CONFIG.SHEET_KARYAWAN) || []).filter(k => {
+      if (!k) return false;
+      const roleStr = (k.role || '').toString().toLowerCase();
+      return k.status_akun === 'Approved' && !roleStr.includes('admin');
+    });
     
     karyawan = karyawan.filter(emp => {
       if (!emp.tgl_resign || emp.tgl_resign === '') return true;
@@ -2012,11 +2310,11 @@ function getRosterData(monthYear, filterDept) {
       karyawan = karyawan.filter(k => k.departemen === filterDept);
     }
 
-    const rosterList = getSheetDataAsObjects(CONFIG.SHEET_ROSTER);
-    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT);
+    const rosterList = getSheetDataAsObjects(CONFIG.SHEET_ROSTER) || [];
+    const shifts = getSheetDataAsObjects(CONFIG.SHEET_SHIFT) || [];
 
     const filteredRoster = rosterList.filter(r => {
-      if (!r.tanggal) return false;
+      if (!r || !r.tanggal) return false;
       return r.tanggal >= cutOff.startIsoStr && r.tanggal <= cutOff.endIsoStr;
     });
 
@@ -2042,10 +2340,10 @@ function saveBulkRoster(rosterItems) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheetRoster = ss.getSheetByName(CONFIG.SHEET_ROSTER);
-    const existingRoster = getSheetDataAsObjects(CONFIG.SHEET_ROSTER);
+    const existingRoster = getSheetDataAsObjects(CONFIG.SHEET_ROSTER) || [];
 
     rosterItems.forEach(item => {
-      const idx = existingRoster.findIndex(r => r.nik === item.nik && r.tanggal === item.tanggal);
+      const idx = existingRoster.findIndex(r => r && r.nik === item.nik && r.tanggal === item.tanggal);
       if (idx !== -1) {
         const rowNum = idx + 2;
         sheetRoster.getRange(rowNum, 4).setValue(item.id_shift);
